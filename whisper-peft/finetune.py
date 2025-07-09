@@ -1,146 +1,174 @@
-from datasets import load_dataset, DatasetDict
+import json
+import time
+import boto3
+import numpy as np
+import sagemaker
+import sagemaker.huggingface
+import os
+from peft import PeftModel, PeftConfig
+from transformers import WhisperForConditionalGeneration, Seq2SeqTrainer
+from huggingface_hub import snapshot_download
+from sagemaker.huggingface import HuggingFace
 from sagemaker.inputs import TrainingInput
-from peft import LoraConfig, get_peft_model
-from transformers import WhisperTokenizer, WhisperFeatureExtractor, Seq2SeqTrainer, Seq2SeqTrainingArguments
+from datasets import load_from_disk
+import torch
+from dataclasses import dataclass
+from typing import Any, Dict, List, Union
+from transformers import WhisperProcessor, WhisperTokenizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import torch
-import numpy as np
 import evaluate
 import gc
 
-# Placeholder variables (replace with actual values)
-model_name_or_path = "openai/whisper-small"
-s3uri = "s3://your-bucket/your-data-prefix"
-BUCKET = "your-bucket"
-PREFIX = "your-prefix"
-TRAINING_JOB_NAME = "your-training-job"
-ROLE = "your-sagemaker-execution-role"
-instance_type = "ml.p3.2xlarge"
-metric_definitions = []
-distribution = {"smdistributed": {"dataparallel": {"enabled": True}}}
-environment = {"SAGEMAKER_PROGRAM": "train.py"}
 
-def prepare_dataset(batch):
-    audio = batch["audio"]
-    batch["input_features"] = feature_extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
-    batch["labels"] = tokenizer(batch["sentence"]).input_ids
-    return batch
 
-def main():
-    language = "Marathi"
-    language_abbr = "mr"
-    task = "transcribe"
-    dataset_name = "mozilla-foundation/common_voice_11_0"
 
-    common_voice = DatasetDict()
-    common_voice["train"] = load_dataset(dataset_name, language_abbr, split="train+validation", use_auth_token=True)
-    common_voice["test"] = load_dataset(dataset_name, language_abbr, split="test", use_auth_token=True)
 
-    global feature_extractor, tokenizer
-    feature_extractor = WhisperFeatureExtractor.from_pretrained(model_name_or_path)
-    tokenizer = WhisperTokenizer.from_pretrained(model_name_or_path, language=language, task=task)
 
-    common_voice = common_voice.map(
-        prepare_dataset,
-        remove_columns=common_voice["train"].column_names,
-        num_proc=2
-    )
-    common_voice.save_to_disk("marathi-common-voice-processed")
 
-    training = TrainingInput(
-        s3_data=s3uri,
-        s3_data_type='S3Prefix',
-        distribution='FullyReplicated',
-        input_mode='FastFile'
-    )
+ROLE = sagemaker.get_execution_role()
+sess = sagemaker.Session()
+BUCKET = sess.default_bucket()
+PREFIX = "whisper/data/marathi-common-voice-processed"
+s3uri = os.path.join("s3://", BUCKET, PREFIX)
+print(f"sagemaker role arn: {ROLE}")
+print(f"sagemaker bucket: {BUCKET}")
+print(f"sagemaker session region: {sess.boto_region_name}")
+print(f"data uri: {s3uri}")
 
-    config = LoraConfig(
-        r=32,
-        lora_alpha=64,
-        target_modules=["q_proj", "v_proj"],
-        lora_dropout=0.05,
-        bias="none"
-    )
-    lora_model = get_peft_model(model, config)
 
-    training_args = Seq2SeqTrainingArguments(
-        output_dir=args.model_dir,
-        per_device_train_batch_size=int(args.train_batch_size),
-        gradient_accumulation_steps=1,
-        learning_rate=float(args.learning_rate),
-        warmup_steps=args.warmup_steps,
-        num_train_epochs=args.num_train_epochs,
-        evaluation_strategy="epoch",
-        fp16=True,
-        per_device_eval_batch_size=args.eval_batch_size,
-        generation_max_length=128,
-        logging_steps=25,
-        remove_unused_columns=False,
-        label_names=["labels"]
-    )
+distribution = None
+instance_type = 'ml.g5.2xlarge'
+training_batch_size = 16
+eval_batch_size = 8
 
-    trainer = Seq2SeqTrainer(
-        args=training_args,
-        model=lora_model,
-        train_dataset=common_voice["train"],
-        eval_dataset=common_voice["test"],
-        data_collator=data_collator,
-        tokenizer=processor.feature_extractor,
-    )
 
-    OUTPUT_PATH = f's3://{BUCKET}/{PREFIX}/{TRAINING_JOB_NAME}/output/'
 
-    from sagemaker.huggingface import HuggingFace
-    huggingface_estimator = HuggingFace(
-        entry_point='train.sh',
-        source_dir='./src',
-        output_path=OUTPUT_PATH,
-        instance_type=instance_type,
-        instance_count=1,
-        py_version='py310',
-        image_uri="<ECR-PATH>",  # Replace this with actual ecr-path
-        role=ROLE,
-        metric_definitions=metric_definitions,
-        volume_size=200,
-        distribution=distribution,
-        keep_alive_period_in_seconds=1800,
-        environment=environment
-    )
+snapshot_download(repo_id="openai/whisper-large-v2", local_dir="/tmp/whisper-large-v2/")
 
-    huggingface_estimator.fit(job_name=TRAINING_JOB_NAME, wait=False)
 
-    # Evaluation
-    metric = evaluate.load("wer")
-    eval_dataloader = DataLoader(common_voice["test"], batch_size=8, collate_fn=data_collator)
+os.system('aws s3 cp --recursive "/tmp/whisper-large-v2" s3://YOUR_BUCKET/whisper-large-v2/pretrain/')
 
-    lora_model.eval()
-    for step, batch in enumerate(tqdm(eval_dataloader)):
-        with torch.cuda.amp.autocast(), torch.no_grad():
-            generated_tokens = lora_model.generate(
+
+
+id = int(time.time())
+TRAINING_JOB_NAME = f"whisper-mr-{id}"
+print('Training job name: ', TRAINING_JOB_NAME)
+
+model_name_s3 = "whisper-large-v2"
+environment = {
+    'MODEL_S3_BUCKET': BUCKET,
+    'MODEL_NAME_S3': model_name_s3,
+    'DATA_S3': s3uri,
+}
+
+metric_definitions = [
+    {'Name': 'eval_loss', 'Regex': "'eval_loss': ([0-9]+(.|e\\-)[0-9]+),?"},
+    {'Name': 'eval_wer', 'Regex': "'eval_wer': ([0-9]+(.|e\\-)[0-9]+),?"},
+    {'Name': 'eval_runtime', 'Regex': "'eval_runtime': ([0-9]+(.|e\\-)[0-9]+),?"},
+    {'Name': 'eval_samples_per_second', 'Regex': "'eval_samples_per_second': ([0-9]+(.|e\\-)[0-9]+),?"},
+    {'Name': 'epoch', 'Regex': "'epoch': ([0-9]+(.|e\\-)[0-9]+),?"}
+]
+
+
+
+training_input_path = s3uri
+training = TrainingInput(
+    s3_data_type='S3Prefix',
+    s3_data=training_input_path,
+    distribution='FullyReplicated',
+    input_mode='FastFile'
+)
+
+
+OUTPUT_PATH = f's3://{BUCKET}/{PREFIX}/{TRAINING_JOB_NAME}/output/'
+
+huggingface_estimator = HuggingFace(
+    entry_point='train.sh',
+    source_dir='./src',
+    output_path=OUTPUT_PATH,
+    instance_type=instance_type,
+    instance_count=1,
+    py_version='py310',
+    image_uri='348052051973.dkr.ecr.us-east-1.amazonaws.com/whisper:training',
+    role=ROLE,
+    metric_definitions=metric_definitions,
+    volume_size=200,
+    distribution=distribution,
+    keep_alive_period_in_seconds=1800,
+    environment=environment,
+)
+
+
+huggingface_estimator.fit(job_name=TRAINING_JOB_NAME)
+os.system('./s5cmd sync s3://YOUR_BUCKET/whisper-large-v2/output/SOME_DATE/whisper_out/adapter_model/ adapter_model/')
+os.system('./s5cmd sync s3://YOUR_BUCKET/whisper-large-v2/pretrain/ /tmp/whisper-large-v2/')
+
+
+
+peft_model_id = "adapter_model"
+peft_config = PeftConfig.from_pretrained(peft_model_id)
+model = WhisperForConditionalGeneration.from_pretrained(
+    peft_config.base_model_name_or_path, load_in_8bit=True, device_map="auto"
+)
+model = PeftModel.from_pretrained(model, peft_model_id)
+model.config.use_cache = True
+
+common_voice = load_from_disk("marathi-common-voice-processed")
+
+
+
+@dataclass
+class DataCollatorSpeechSeq2SeqWithPadding:
+    processor: Any
+
+    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        input_features = [{"input_features": feature["input_features"]} for feature in features]
+        batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
+
+        label_features = [{"input_ids": feature["labels"]} for feature in features]
+        labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
+        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+
+        if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().cpu().item():
+            labels = labels[:, 1:]
+
+        batch["labels"] = labels
+        return batch
+
+
+
+model_name_or_path = "/tmp/whisper-large-v2"
+language = "Marathi"
+task = "transcribe"
+tokenizer = WhisperTokenizer.from_pretrained(model_name_or_path, language=language, task=task)
+processor = WhisperProcessor.from_pretrained(model_name_or_path, language=language, task=task)
+data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)
+
+
+
+metric = evaluate.load("wer")
+eval_dataloader = DataLoader(common_voice["test"], batch_size=8, collate_fn=data_collator)
+
+model.eval()
+for step, batch in enumerate(tqdm(eval_dataloader)):
+    with torch.cuda.amp.autocast():
+        with torch.no_grad():
+            generated_tokens = model.generate(
                 input_features=batch["input_features"].to("cuda"),
                 decoder_input_ids=batch["labels"][:, :4].to("cuda"),
                 max_new_tokens=255,
             ).cpu().numpy()
 
-        labels = batch["labels"].cpu().numpy()
-        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+            labels = batch["labels"].cpu().numpy()
+            labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
 
-        decoded_preds = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
-        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+            decoded_preds = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+            decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+            metric.add_batch(predictions=decoded_preds, references=decoded_labels)
 
-        metric.add_batch(predictions=decoded_preds, references=decoded_labels)
+    del generated_tokens, labels, batch
+    gc.collect()
 
-        del generated_tokens, labels, batch
-        gc.collect()
-
-    wer = 100 * metric.compute()["wer"]
-    print(f"{wer=:.2f}%")
-
-if __name__ == "__main__":
-    main()
-
-
-    
-    
-    
+wer = 100 * metric.compute()
+print(f"{wer=}")
